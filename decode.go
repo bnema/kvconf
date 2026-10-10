@@ -231,14 +231,16 @@ func newField(where string, t reflect.Type, tag reflect.StructTag, opts []string
 			if item.item != nil {
 				return nil, fmt.Errorf("kvconf: %s: nested lists are not supported", where)
 			}
-			item.oneof, f.oneof = f.oneof, nil
-			f.item = item
+			// The item reads oneof, min and max from the same tag and
+			// checks each element against them.
+			f.item, f.oneof = item, nil
+			return f, nil
 		default:
 			return nil, fmt.Errorf("kvconf: %s: unsupported type %s", where, t)
 		}
 	}
 	bound := func(s string) (float64, error) {
-		if f.duration || f.item != nil && f.item.duration {
+		if f.duration {
 			d, err := time.ParseDuration(s)
 			return float64(d), err
 		}
@@ -256,11 +258,6 @@ func newField(where string, t reflect.Type, tag reflect.StructTag, opts []string
 		if f.max, err = bound(f.maxText); err != nil {
 			return nil, fmt.Errorf("kvconf: %s: bad max %q", where, f.maxText)
 		}
-	}
-	if f.item != nil {
-		f.item.hasMin, f.item.min, f.item.minText = f.hasMin, f.min, f.minText
-		f.item.hasMax, f.item.max, f.item.maxText = f.hasMax, f.max, f.maxText
-		f.hasMin, f.hasMax = false, false
 	}
 	return f, nil
 }
@@ -420,7 +417,7 @@ func (s *schema) apply(st *decodeState, e *Entry) (msg string, known bool) {
 			return msg, true
 		}
 		if f.typ == stringMapType && f.val.plain() {
-			(*(*map[string]string)(m.Addr().UnsafePointer()))[name] = e.Value
+			m.Interface().(map[string]string)[name] = e.Value
 			return "", true
 		}
 		key, val := st.scratch(f)

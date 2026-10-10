@@ -39,9 +39,10 @@ func TestLoad(t *testing.T) {
 		want     liveConfig
 		warnings int
 		err      string
+		notExist bool
 	}{
 		{name: "missing file gives defaults", want: liveConfig{"dark", time.Minute}},
-		{name: "missing file required", opts: Options{RequireFile: true}, err: "config"},
+		{name: "missing file required", opts: Options{RequireFile: true}, notExist: true},
 		{name: "file over defaults", content: ptr("theme = light\n"), want: liveConfig{"light", time.Minute}},
 		{name: "lenient bad value", content: ptr("theme = blue\nafter = 2m\n"), want: liveConfig{"dark", 2 * time.Minute}, warnings: 1},
 		{name: "strict bad value", content: ptr("theme = blue\n"), opts: Options{Strict: true}, err: "line 1: theme: must be dark or light"},
@@ -53,6 +54,12 @@ func TestLoad(t *testing.T) {
 				must(t, os.WriteFile(path, []byte(*tt.content), 0o600))
 			}
 			cfg, warnings, err := Load[liveConfig](path, tt.opts)
+			if tt.notExist {
+				if !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("err = %v, want fs.ErrNotExist", err)
+				}
+				return
+			}
 			if tt.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.err) {
 					t.Fatalf("err = %v, want %q", err, tt.err)
@@ -66,13 +73,40 @@ func TestLoad(t *testing.T) {
 	}
 }
 
-func TestLoadValidatesDefaults(t *testing.T) {
-	_, _, err := Load[strictPair](filepath.Join(t.TempDir(), "none"), Options{})
-	must(t, err)
-	path := writeTemp(t, t.TempDir(), "config", "a = 3\nb = 2\n")
-	if _, _, err := Load[strictPair](path, Options{}); err == nil || err.Error() != path+": a must not exceed b" {
-		t.Fatalf("err = %v", err)
+// badDefaults has defaults that fail its own Validate.
+type badDefaults struct{ strictPair }
+
+func (p *badDefaults) SetDefaults()    { p.A, p.B = 3, 2 }
+func (p *badDefaults) Validate() error { return p.strictPair.Validate() }
+
+func TestLoadValidates(t *testing.T) {
+	dir := t.TempDir()
+	bad := writeTemp(t, dir, "bad", "a = 3\nb = 2\n")
+	tests := []struct {
+		name string
+		load func(path string) error
+		path string
+		err  string
+	}{
+		{name: "valid zero defaults", load: loadErr[strictPair], path: filepath.Join(dir, "none")},
+		{name: "invalid file", load: loadErr[strictPair], path: bad, err: bad + ": a must not exceed b"},
+		{name: "invalid defaults", load: loadErr[badDefaults], path: filepath.Join(dir, "none"), err: "a must not exceed b"},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.load(tt.path)
+			if tt.err == "" {
+				must(t, err)
+			} else if err == nil || err.Error() != tt.err {
+				t.Fatalf("err = %v, want %q", err, tt.err)
+			}
+		})
+	}
+}
+
+func loadErr[T any](path string) error {
+	_, _, err := Load[T](path, Options{})
+	return err
 }
 
 // liveRecorder collects what a Live reports.
@@ -161,6 +195,30 @@ func TestLive(t *testing.T) {
 			steps: func(t *testing.T, path string, l *Live[liveConfig], r *liveRecorder) {
 				must(t, os.WriteFile(path, []byte("# note\ntheme   =   light   # same\n"), 0o600))
 				r.quiet(t, "a save that changes no value")
+			},
+		},
+		{
+			name:    "reordered keys",
+			initial: ptr("theme = light\nafter = 5s\n"),
+			steps: func(t *testing.T, path string, l *Live[liveConfig], r *liveRecorder) {
+				old := l.Get()
+				must(t, os.WriteFile(path, []byte("after = 5s\ntheme = light\n"), 0o600))
+				r.quiet(t, "a save that only reorders keys")
+				if l.Get() != old {
+					t.Fatal("config swapped")
+				}
+			},
+		},
+		{
+			name: "empty file created then removed",
+			steps: func(t *testing.T, path string, l *Live[liveConfig], r *liveRecorder) {
+				must(t, os.WriteFile(path, nil, 0o600))
+				r.quiet(t, "an empty file")
+				must(t, os.Remove(path))
+				r.wait(t, "a removal")
+				if _, err := r.last(); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("err = %v", err)
+				}
 			},
 		},
 		{
@@ -263,12 +321,13 @@ func TestLiveSeesSaveBetweenOpenAndRun(t *testing.T) {
 }
 
 func TestLiveRunTwice(t *testing.T) {
-	l, _, err := Open(filepath.Join(t.TempDir(), "config"), LiveOptions[liveConfig]{})
+	ready := make(chan struct{})
+	l, _, err := Open(filepath.Join(t.TempDir(), "config"), LiveOptions[liveConfig]{Watch: WatchOptions{Ready: ready}})
 	must(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = l.Run(ctx) }()
-	time.Sleep(50 * time.Millisecond)
+	<-ready
 	if err := l.Run(ctx); err == nil {
 		t.Fatal("a second Run was accepted")
 	}

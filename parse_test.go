@@ -3,6 +3,7 @@ package kvconf
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -225,7 +226,7 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-parse: %v\n%s", err, data)
 		}
-		if !sameEntries(entries, again) {
+		if !slices.EqualFunc(entries, again, func(x, y Entry) bool { return x.Key == y.Key && x.Value == y.Value }) {
 			t.Fatalf("round trip:\n%#v\n%#v", entries, again)
 		}
 	})
