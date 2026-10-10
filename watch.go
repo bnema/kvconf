@@ -126,6 +126,11 @@ func Watch(ctx context.Context, path string, opts WatchOptions, out chan<- struc
 		}
 		if !pending.IsZero() && !now.Before(pending) {
 			pending = time.Time{}
+			// Record what is reported, so a later rewatch does not report
+			// the same change again.
+			for _, t := range w.targets {
+				w.stampsChanged(t)
+			}
 			select {
 			case out <- struct{}{}:
 			default:
@@ -158,6 +163,24 @@ type target struct {
 	// next is the missing child on the way to the wanted directory: its
 	// creation means the watches must move down.
 	next string
+	// paths are dir joined with names and next, computed once.
+	paths []string
+	// moved lists watched child directories whose rename must move the
+	// watches (Windows does not report a watched directory's own rename).
+	moved []string
+}
+
+// stampPaths lists the full paths whose stamps matter.
+func (t *target) stampPaths() []string {
+	if t.paths == nil {
+		for _, n := range t.names {
+			t.paths = append(t.paths, filepath.Join(t.dir, n))
+		}
+		if t.next != "" {
+			t.paths = append(t.paths, filepath.Join(t.dir, t.next))
+		}
+	}
+	return t.paths
 }
 
 func (t *target) has(name string) bool {
@@ -187,25 +210,65 @@ type watcher struct {
 	stamps  map[string]stamp
 }
 
-// chain lists path and every symlink target it goes through.
+// chain lists the paths whose change can change what path names: path
+// itself, every symlink met while resolving it, in the file name or in a
+// parent directory (GNU stow links whole directories), and the final file.
+// The resolved file is last.
 func chain(path string) []string {
-	out := []string{filepath.Clean(path)}
-	for len(out) <= 40 { // the kernel's symlink limit
-		cur := out[len(out)-1]
-		link, err := os.Readlink(cur)
-		if err != nil {
+	path = filepath.Clean(path)
+	out := []string{path}
+	resolved, links := path, 0
+	for {
+		next, link, ok := resolveOnce(resolved)
+		if !ok {
 			break
 		}
-		if !filepath.IsAbs(link) {
-			link = filepath.Join(filepath.Dir(cur), link)
+		if links++; links > 40 { // the kernel's symlink limit
+			break
 		}
-		link = filepath.Clean(link)
-		if slices.Contains(out, link) {
+		if !slices.Contains(out, link) {
+			out = append(out, link)
+		}
+		if slices.Contains(out, next) && next != path {
 			break // a loop: the file is unreadable anyway
 		}
-		out = append(out, link)
+		resolved = next
+	}
+	if resolved != path {
+		out = append(slices.DeleteFunc(out, func(p string) bool { return p == resolved }), resolved)
 	}
 	return out
+}
+
+// resolveOnce replaces the first symlink in path, from the root down, by its
+// target. link is the symlink's own path.
+func resolveOnce(path string) (next, link string, ok bool) {
+	vol := filepath.VolumeName(path)
+	rest := path[len(vol):]
+	cur := vol
+	for rest != "" {
+		sep := strings.IndexByte(rest, filepath.Separator)
+		var part string
+		if sep < 0 {
+			part, rest = rest, ""
+		} else {
+			part, rest = rest[:sep], rest[sep+1:]
+		}
+		if part == "" {
+			cur += string(filepath.Separator)
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		target, err := os.Readlink(cur)
+		if err != nil {
+			continue // not a link, or missing: later parts cannot resolve
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(cur), target)
+		}
+		return filepath.Join(target, rest), cur, true
+	}
+	return path, "", false
 }
 
 func isDir(path string) bool {
@@ -255,6 +318,14 @@ func (w *watcher) plan() (targets []*target, files []string) {
 			add(filepath.Dir(f), normName(filepath.Base(f)), false)
 		}
 	}
+	if runtime.GOOS == "windows" {
+		for _, t := range slices.Clone(targets) {
+			if parent := filepath.Dir(t.dir); parent != t.dir && isDir(parent) {
+				p := get(parent)
+				p.moved = append(p.moved, normName(filepath.Base(t.dir)))
+			}
+		}
+	}
 	return targets, files
 }
 
@@ -285,12 +356,14 @@ func (w *watcher) rewatchChanged(b backend) (missing, changed bool, err error) {
 
 func sameTargets(a, b []*target) bool {
 	return slices.EqualFunc(a, b, func(x, y *target) bool {
-		return x.dir == y.dir && x.all == y.all && x.next == y.next && slices.Equal(x.names, y.names)
+		return x.dir == y.dir && x.all == y.all && x.next == y.next && slices.Equal(x.names, y.names) &&
+			slices.Equal(x.moved, y.moved)
 	})
 }
 
-// classify reports whether evs touch a watched file, and whether the
-// watches must be installed again.
+// classify reports whether evs touch a watched file, whether the watches
+// must be installed again, and whether to look again later because a
+// watch was lost.
 func (w *watcher) classify(evs []event) (relevant, rewatch, recheck bool) {
 	relinked := false
 	for _, ev := range evs {
@@ -310,23 +383,31 @@ func (w *watcher) classify(evs []event) (relevant, rewatch, recheck bool) {
 			continue
 		}
 		name := normName(ev.name)
-		if t.next != "" && name == t.next {
+		if t.next != "" && name == t.next || ev.moved && slices.Contains(t.moved, name) {
 			relevant, rewatch = true, true
 		}
-		// Some systems (Windows, network file systems) do not report a
-		// watched directory that was removed: check it on removals.
 		if ev.moved && !rewatch && !isDir(t.dir) {
-			relevant, rewatch = true, true
+			// Some systems (Windows, network file systems) do not report a
+			// watched directory that was removed: look again later.
+			relevant, rewatch, recheck = true, true, true
+			continue
 		}
 		if t.has(name) {
+			if t.all && ev.moved && isDir(filepath.Join(t.dir, name)) {
+				continue // Dir mode ignores subdirectories
+			}
 			relevant = true
 			relinked = relinked || ev.moved
+			// Windows reports a removed directory only once its last handle,
+			// ours, closes: after a removal inside it, look again later. The
+			// stamps keep that second look from reporting the change twice.
+			recheck = recheck || ev.moved && runtime.GOOS == "windows"
 		}
 	}
 	if relinked && !rewatch && !w.dir && !slices.Equal(chain(w.path), w.chain) {
 		rewatch = true // a link points elsewhere now
 	}
-	return relevant, rewatch, recheck || relinked
+	return relevant, rewatch, recheck
 }
 
 func (w *watcher) find(dir string) *target {
@@ -354,8 +435,7 @@ func stampOf(info fs.FileInfo) stamp {
 // reports whether any was created, changed or removed.
 func (w *watcher) stampsChanged(t *target) bool {
 	changed := false
-	check := func(name string, info fs.FileInfo) {
-		key := t.dir + string(filepath.Separator) + name
+	check := func(key string, info fs.FileInfo) {
 		old, had := w.stamps[key]
 		if info == nil {
 			if had {
@@ -369,20 +449,16 @@ func (w *watcher) stampsChanged(t *target) bool {
 			changed = true
 		}
 	}
-	names := t.names
-	if t.next != "" {
-		names = append(slices.Clip(names), t.next)
-	}
-	for _, name := range names {
-		info, err := os.Lstat(filepath.Join(t.dir, name))
+	paths := t.stampPaths()
+	for _, p := range paths {
+		info, err := os.Lstat(p)
 		if err != nil {
 			info = nil
 		}
-		check(name, info)
+		check(p, info)
 	}
 	if t.all {
 		entries, _ := os.ReadDir(t.dir)
-		prefix := t.dir + string(filepath.Separator)
 		live := map[string]bool{}
 		for _, e := range entries {
 			if !visible(e.Name()) || e.IsDir() {
@@ -392,12 +468,12 @@ func (w *watcher) stampsChanged(t *target) bool {
 			if err != nil {
 				continue
 			}
-			live[e.Name()] = true
-			check(e.Name(), info)
+			key := filepath.Join(t.dir, e.Name())
+			live[key] = true
+			check(key, info)
 		}
 		for key := range w.stamps {
-			if rest, ok := strings.CutPrefix(key, prefix); ok && !strings.ContainsRune(rest, filepath.Separator) &&
-				!live[rest] && !slices.Contains(names, rest) {
+			if filepath.Dir(key) == t.dir && !live[key] && !slices.Contains(paths, key) {
 				delete(w.stamps, key)
 				changed = true
 			}

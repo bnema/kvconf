@@ -71,15 +71,61 @@ func TestSet(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := string(Set([]byte(tt.in), tt.values)); got != tt.want {
+			got, err := Set([]byte(tt.in), tt.values)
+			must(t, err)
+			if string(got) != tt.want {
 				t.Errorf("got\n%q\nwant\n%q", got, tt.want)
 			}
 		})
 	}
 }
 
+func TestSetRejectsInjection(t *testing.T) {
+	for _, key := range []string{"", "a = b", "a\nadmin", "bind.q = y\nadmin", "# a", " a"} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := Set(nil, map[string]*string{key: ptr("v")}); err == nil {
+				t.Fatalf("Set accepted key %q", key)
+			}
+		})
+	}
+}
+
+func TestMarshalRejectsInjection(t *testing.T) {
+	tests := []struct {
+		name string
+		v    any
+	}{
+		{"map name with newline", &marshalConfig{Binds: map[string]string{"x = 1\nadmin": "y"}}},
+		{"map name with equals", &marshalConfig{Binds: map[string]string{"a=b": "y"}}},
+		{"catch-all key", &marshalConfig{Rest: map[string]string{"a\nb": "y"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Marshal(tt.v); err == nil {
+				t.Fatal("Marshal accepted an injected key")
+			}
+		})
+	}
+}
+
+// upper marshals with a pointer receiver, like many TextMarshalers.
+type upper string
+
+func (u *upper) UnmarshalText(b []byte) error { *u = upper(strings.ToLower(string(b))); return nil }
+func (u *upper) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(string(*u))), nil }
+
+func TestMarshalPointerReceiver(t *testing.T) {
+	type cfg struct {
+		U upper            `kv:"u"`
+		M map[string]upper `kv:"m.*"`
+	}
+	data, err := Marshal(&cfg{U: "hello", M: map[string]upper{"a": "x"}})
+	must(t, err)
+	eq(t, string(data), "u = HELLO\nm.a = X\n")
+}
+
 func TestQuoteRoundTrip(t *testing.T) {
-	for _, v := range []string{"", "plain", "#ff0000", "a # b", " lead", "trail ", `"q"`, "it's", "a\nb", `back\slash`, "x\t#y"} {
+	for _, v := range []string{"", "plain", "#ff0000", "a # b", " lead", "trail ", `"q"`, "it's", "a\nb", `back\slash`, "x\t#y", `it's "x # y"`, "don't # x"} {
 		t.Run(v, func(t *testing.T) {
 			entries, _, err := ParseBytes([]byte("k = "+Quote(v)+"\n"), Options{})
 			if err != nil || len(entries) != 1 || entries[0].Value != v {

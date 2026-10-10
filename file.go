@@ -24,7 +24,7 @@ func ReadFile(path string, opts Options) ([]byte, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, &os.PathError{Op: "read", Path: path, Err: errNotRegular}
+		return nil, &os.PathError{Op: "read", Path: path, Err: ErrNotRegular}
 	}
 	data, err := readLimited(f, opts.maxBytes())
 	if errors.Is(err, ErrTooLarge) {
@@ -79,7 +79,7 @@ func (p Path) MarshalText() ([]byte, error) { return []byte(p), nil }
 // ExpandPath expands a leading ~/ and requires an absolute, NUL-free path.
 func ExpandPath(s string) (string, error) {
 	if s == "" || strings.IndexByte(s, 0) >= 0 {
-		return "", errors.New("must be a non-empty path")
+		return "", ValueError("must be a non-empty path")
 	}
 	if rest, ok := strings.CutPrefix(s, "~/"); ok || s == "~" {
 		if !ok {
@@ -87,17 +87,18 @@ func ExpandPath(s string) (string, error) {
 		}
 		home, err := os.UserHomeDir()
 		if err != nil || !filepath.IsAbs(home) {
-			return "", errors.New("no absolute home directory for ~")
+			return "", ValueError("no absolute home directory for ~")
 		}
 		s = filepath.Join(home, rest)
 	}
 	if !filepath.IsAbs(s) {
-		return "", errors.New("must be an absolute path or start with ~/")
+		return "", ValueError("must be an absolute path or start with ~/")
 	}
 	return filepath.Clean(s), nil
 }
 
-var errNotRegular = errors.New("not a regular file")
+// ErrNotRegular is returned by ReadFile for a directory, FIFO or device.
+var ErrNotRegular = errors.New("not a regular file")
 
 // isNotExist reports a missing file, including a missing parent directory.
 func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }

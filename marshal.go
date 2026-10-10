@@ -29,17 +29,15 @@ func needsQuote(v string) bool {
 	if v[0] == '"' || v[0] == '\'' {
 		return true // it would be unquoted on reading
 	}
-	for i := 0; i < len(v); i++ {
-		switch v[i] {
-		case '\n', '\r':
-			return true
-		case '#':
-			if i > 0 && (v[i-1] == ' ' || v[i-1] == '\t') {
-				return true
-			}
-		}
-	}
-	return false
+	// A '#' after a space ends the value unless it is inside a quoted word,
+	// so quote any value where Parse would cut it.
+	return strings.ContainsAny(v, "\n\r") || stripComment(v, CommentSpaced) != v
+}
+
+// validKey reports whether key can be written and read back as one key.
+func validKey(key string) bool {
+	return key != "" && key[0] != '#' && key == strings.TrimSpace(key) &&
+		!strings.ContainsAny(key, "=\n\r")
 }
 
 func appendQuoted(b []byte, v string) []byte {
@@ -103,12 +101,16 @@ func Marshal(v any) ([]byte, error) {
 		fv := rv.FieldByIndex(s.catchAll.index)
 		if es, ok := fv.Interface().([]Entry); ok {
 			for _, e := range es {
-				m.raw(e.Key, e.Value)
+				if err := m.raw(e.Key, e.Value); err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			kv := fv.Interface().(map[string]string)
 			for _, k := range slices.Sorted(maps.Keys(kv)) {
-				m.raw(k, kv[k])
+				if err := m.raw(k, kv[k]); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -120,16 +122,23 @@ type marshaler struct {
 	tmp []byte // the value being formatted, reused
 }
 
-func (m *marshaler) raw(key, value string) {
+func (m *marshaler) raw(key, value string) error {
+	if !validKey(key) {
+		return fmt.Errorf("kvconf: invalid key %q", key)
+	}
 	m.b = append(m.b, key...)
 	m.b = append(m.b, " = "...)
 	m.b = appendQuoted(m.b, value)
 	m.b = append(m.b, '\n')
+	return nil
 }
 
 // line writes prefix+name[.sub] = value.
 func (m *marshaler) line(prefix, name, sub string, v reflect.Value, f *field) error {
 	var err error
+	if name != "" && (strings.ContainsAny(name, "=\n\r") || name != strings.TrimSpace(name)) {
+		return fmt.Errorf("kvconf: %s: invalid map name %q", prefix, name)
+	}
 	if m.tmp, err = appendValue(m.tmp[:0], v, f); err != nil {
 		key := prefix + name
 		if sub != "" {
@@ -154,8 +163,19 @@ func appendValue(b []byte, v reflect.Value, f *field) ([]byte, error) {
 	if f.off && v.IsZero() {
 		return append(b, "off"...), nil
 	}
-	if v.Type().Implements(marshalType) {
-		text, err := v.Interface().(encoding.TextMarshaler).MarshalText()
+	if f.marshal {
+		if !v.CanAddr() { // a map element: copy it to call a pointer method
+			p := reflect.New(v.Type())
+			p.Elem().Set(v)
+			v = p.Elem()
+		}
+		var tm encoding.TextMarshaler
+		if v.Type().Implements(marshalType) {
+			tm = v.Interface().(encoding.TextMarshaler)
+		} else {
+			tm = v.Addr().Interface().(encoding.TextMarshaler)
+		}
+		text, err := tm.MarshalText()
 		return append(b, text...), err
 	}
 	switch v.Kind() {

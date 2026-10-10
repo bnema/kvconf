@@ -21,7 +21,7 @@ output.DP-1.scale = 1.5
 - **Safe for real configs**: atomic saves, symlinked dotfiles, editors that
   save by rename, missing directories, broken files that keep the last good
   config, and warnings that never print values (they may be secrets).
-- **Fast**: about 540 MB/s to parse, no allocation per watched event.
+- **Fast**: about 800 MB/s to parse, a few allocations per reported change.
 
 ```sh
 go get github.com/bnema/kvconf

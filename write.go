@@ -2,6 +2,7 @@ package kvconf
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,10 +15,15 @@ import (
 // last one) is replaced; otherwise a commented-out `# key = ...` is enabled;
 // otherwise the key goes after the last key sharing its longest dotted
 // parent, or at the end. A nil value removes every assignment of the key.
-// Keys are applied in sorted order, so the output is deterministic.
-func Set(data []byte, values map[string]*string) []byte {
+// Keys are applied in sorted order, so the output is deterministic. A key
+// that cannot be read back as written (empty, with '=' or a line break,
+// starting with '#') is an error and nothing is changed.
+func Set(data []byte, values map[string]*string) ([]byte, error) {
 	keys := make([]string, 0, len(values))
 	for k := range values {
+		if !validKey(k) {
+			return nil, fmt.Errorf("kvconf: invalid key %q", k)
+		}
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
@@ -28,7 +34,7 @@ func Set(data []byte, values map[string]*string) []byte {
 			data = setKey(data, k, *v)
 		}
 	}
-	return data
+	return data, nil
 }
 
 // lineKey returns the key of an assignment line, or "" for anything else.
@@ -160,7 +166,10 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return rename(tmp.Name(), path)
+	if err := rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func writeSync(f *os.File, data []byte, perm os.FileMode) error {
@@ -177,9 +186,12 @@ func writeSync(f *os.File, data []byte, perm os.FileMode) error {
 // SetFile applies Set to the file at path and writes it back atomically. A
 // missing file is created with perm.
 func SetFile(path string, values map[string]*string, perm os.FileMode) error {
-	data, err := os.ReadFile(path)
+	data, err := ReadFile(path, Options{})
 	if err != nil && !isNotExist(err) {
 		return err
 	}
-	return WriteFile(path, Set(data, values), perm)
+	if data, err = Set(data, values); err != nil {
+		return err
+	}
+	return WriteFile(path, data, perm)
 }

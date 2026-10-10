@@ -58,10 +58,15 @@ func (in *inotify) set(targets []*target) (missing bool, err error) {
 		}
 	}
 	for dir := range want {
-		if _, ok := in.wds[dir]; ok {
-			continue
-		}
+		// Always add: a directory renamed away and replaced keeps its path
+		// but not its inode, and adding returns the watch of the current
+		// one (the same descriptor when nothing moved).
 		wd, err := syscall.InotifyAddWatch(in.fd, dir, inotifyMask)
+		if old, ok := in.wds[dir]; ok && (err != nil || old != int32(wd)) {
+			_, _ = syscall.InotifyRmWatch(in.fd, uint32(old))
+			delete(in.wds, dir)
+			delete(in.dirs, old)
+		}
 		if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
 			missing = true
 			continue
@@ -110,8 +115,12 @@ func (in *inotify) wait(timeout time.Duration, evs []event) ([]event, error) {
 			continue // a watch we removed
 		}
 		if ev.Mask&(syscall.IN_IGNORED|syscall.IN_DELETE_SELF|syscall.IN_MOVE_SELF) != 0 {
-			if ev.Mask&syscall.IN_IGNORED != 0 {
-				delete(in.dirs, ev.Wd)
+			// The watch follows the inode, not the path: drop it.
+			if ev.Mask&syscall.IN_IGNORED == 0 {
+				_, _ = syscall.InotifyRmWatch(in.fd, uint32(ev.Wd))
+			}
+			delete(in.dirs, ev.Wd)
+			if in.wds[dir] == ev.Wd {
 				delete(in.wds, dir)
 			}
 			evs = append(evs, event{dir: dir, lost: true})

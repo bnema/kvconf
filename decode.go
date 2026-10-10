@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
@@ -31,6 +32,13 @@ import (
 // pointer implements encoding.TextUnmarshaler, such as [Path]. Named types
 // work too: type Mode string with oneof is an enum.
 
+// ValueError is an error message that is safe to show in a Warning: it
+// does not contain the value. Return one from UnmarshalText to explain a
+// rejected value; any other error is reported as "invalid <type>".
+type ValueError string
+
+func (e ValueError) Error() string { return string(e) }
+
 // Validator is implemented by a config that checks itself after decoding,
 // for rules that span several keys. Its error always fails the load.
 type Validator interface{ Validate() error }
@@ -55,6 +63,7 @@ type field struct {
 	index    []int
 	typ      reflect.Type
 	text     bool // *typ implements encoding.TextUnmarshaler
+	marshal  bool // typ or *typ implements encoding.TextMarshaler
 	duration bool
 	off      bool
 	nonempty bool
@@ -198,7 +207,8 @@ func (s *schema) add(t reflect.Type, prefix string, index []int) error {
 
 // newField checks that t can be decoded and precomputes how.
 func newField(where string, t reflect.Type, tag reflect.StructTag, opts []string) (*field, error) {
-	f := &field{typ: t, text: isText(t), duration: t == durationType, sep: tag.Get("sep")}
+	f := &field{typ: t, text: isText(t), duration: t == durationType, sep: tag.Get("sep"),
+		marshal: t.Implements(marshalType) || reflect.PointerTo(t).Implements(marshalType)}
 	f.off = slices.Contains(opts, "off")
 	f.nonempty = slices.Contains(opts, "nonempty")
 	if f.sep == "" {
@@ -460,7 +470,12 @@ func (f *field) decode(dst reflect.Value, raw string) error {
 	if f.text {
 		p := reflect.New(f.typ)
 		if err := p.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(raw)); err != nil {
-			return err
+			// Third-party errors often quote the input: show only ours.
+			var ve ValueError
+			if errors.As(err, &ve) {
+				return ve
+			}
+			return errors.New("invalid " + f.typ.String())
 		}
 		dst.Set(p.Elem())
 		return nil
@@ -537,6 +552,9 @@ func (f *field) plain() bool {
 }
 
 func (f *field) check(x float64) error {
+	if x != x || (f.hasMin || f.hasMax) && math.IsInf(x, 0) {
+		return errors.New("must be a finite number")
+	}
 	if f.hasMin && x < f.min {
 		return errors.New("must be at least " + f.minText)
 	}

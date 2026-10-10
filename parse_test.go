@@ -80,6 +80,11 @@ g = spawn "foo bar"
 			},
 		},
 		{
+			name: "apostrophe inside a word keeps the comment",
+			in:   "title = it's fine   # a note\nb = say \"x # y\" # c\n",
+			want: []Entry{{"title", "it's fine", 1}, {"b", `say "x # y"`, 2}},
+		},
+		{
 			name: "raw values",
 			in:   `a = "x"` + "\n",
 			opts: Options{RawValues: true},
@@ -99,9 +104,14 @@ g = spawn "foo bar"
 		},
 		{
 			name:     "bad lines are skipped",
-			in:       "nope\n= 1\na b = 1\nok = 1\n",
-			want:     []Entry{{"ok", "1", 4}},
-			warnings: []string{"line 1: expected key = value", "line 2: missing key", "line 3: key contains a space"},
+			in:       "nope\n= 1\nok = 1\n",
+			want:     []Entry{{"ok", "1", 3}},
+			warnings: []string{"line 1: expected key = value", "line 2: missing key"},
+		},
+		{
+			name: "key with spaces",
+			in:   "layout.LG Electronics 27GR95UM.overflow  = scroll\n",
+			want: []Entry{{"layout.LG Electronics 27GR95UM.overflow", "scroll", 1}},
 		},
 		{
 			name:     "strict stops at first problem",

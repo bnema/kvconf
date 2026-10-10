@@ -206,13 +206,10 @@ func ParseBytes(data []byte, opts Options) ([]Entry, []Warning, error) {
 			}
 			continue
 		}
+		// A key may contain spaces: output names such as "LG Electronics 27GR95UM".
 		key := strings.TrimSpace(line[:eq])
-		if key == "" || strings.ContainsAny(key, " \t") {
-			msg := "missing key"
-			if key != "" {
-				msg = "key contains a space"
-			}
-			if !p.add(n, "", msg) {
+		if key == "" {
+			if !p.add(n, "", "missing key") {
 				break
 			}
 			continue
@@ -250,7 +247,8 @@ func stripComment(v string, style CommentStyle) string {
 			} else if c == quote {
 				quote = 0
 			}
-		case c == '"' || c == '\'':
+		case (c == '"' || c == '\'') && (i == 0 || v[i-1] == ' ' || v[i-1] == '\t'):
+			// Only a quote that starts a word opens a string: it's stays text.
 			quote = c
 		case c == '#' && (style == CommentAny || i > 0 && (v[i-1] == ' ' || v[i-1] == '\t')):
 			return strings.TrimSpace(v[:i])

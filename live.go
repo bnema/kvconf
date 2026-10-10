@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
 	"sync/atomic"
 )
 
@@ -82,7 +83,8 @@ type Live[T any] struct {
 	path    string
 	opts    LiveOptions[T]
 	cur     atomic.Pointer[T]
-	entries []Entry
+	entries []Entry // owned by Run
+	running atomic.Bool
 }
 
 // Open loads the config file at path and returns it with the warnings of
@@ -106,8 +108,11 @@ func (l *Live[T]) Path() string { return l.path }
 // Run watches the file and reloads it until ctx ends. A reload that fails,
 // or a removed file, keeps the current config. A save that changes no value
 // (a comment, spacing, the same file written again) reloads nothing. Run
-// returns nil when ctx ends, or the error of the watcher.
+// returns nil when ctx ends, or the error of the watcher. Call it once.
 func (l *Live[T]) Run(ctx context.Context) error {
+	if !l.running.CompareAndSwap(false, true) {
+		return errors.New("kvconf: Live.Run called twice")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	changed := make(chan struct{}, 1)
@@ -159,15 +164,39 @@ func (l *Live[T]) reload() {
 	if sameEntries(entries, l.entries) {
 		return
 	}
-	keys := Changed(Values(l.entries), Values(entries))
+	// Compare every assignment, not the last one: a repeated key whose
+	// last value is invalid decodes to an earlier one.
+	keys := changedKeys(l.entries, entries)
 	l.entries = entries
-	if len(keys) == 0 {
-		return
-	}
 	old := l.cur.Swap(cfg)
 	if l.opts.OnChange != nil {
 		l.opts.OnChange(Change[T]{Old: old, New: cfg, Keys: keys, Warnings: warnings})
 	}
+}
+
+// changedKeys lists, sorted, the keys whose assignments differ.
+func changedKeys(old, cur []Entry) []string {
+	group := func(es []Entry) map[string][]string {
+		m := make(map[string][]string, len(es))
+		for _, e := range es {
+			m[e.Key] = append(m[e.Key], e.Value)
+		}
+		return m
+	}
+	a, b := group(old), group(cur)
+	var keys []string
+	for k, v := range b {
+		if !slices.Equal(a[k], v) {
+			keys = append(keys, k)
+		}
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func (l *Live[T]) report(err error) {

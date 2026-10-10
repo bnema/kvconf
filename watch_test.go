@@ -185,6 +185,54 @@ func TestWatch(t *testing.T) {
 			},
 		},
 		{
+			name:  "directory renamed away and replaced",
+			rel:   "app/config",
+			setup: func(e *watchEnv) { e.write("app/config", "a = 1\n"); e.write("new/config", "a = 2\n") },
+			steps: func(e *watchEnv) {
+				must(e.t, os.Rename(filepath.Join(e.dir, "app"), filepath.Join(e.dir, "app.old")))
+				must(e.t, os.Rename(filepath.Join(e.dir, "new"), filepath.Join(e.dir, "app")))
+				e.expectChange("the directory swap")
+				e.settle()
+				e.write("app/config", "a = 3\n")
+				e.expectChange("a write in the new directory")
+				e.settle()
+				e.write("app.old/config", "a = 4\n")
+				e.expectQuiet("a write in the old directory")
+			},
+		},
+		{
+			name: "symlinked parent directory retargeted",
+			rel:  "app/config",
+			setup: func(e *watchEnv) {
+				e.write("one/config", "a = 1\n")
+				e.write("two/config", "a = 2\n")
+				e.symlink("one", "app")
+			},
+			steps: func(e *watchEnv) {
+				e.write("one/config", "a = 3\n")
+				e.expectChange("a write through the linked directory")
+				e.settle()
+				e.symlink("two", "app")
+				e.expectChange("retargeting the directory link")
+				e.settle()
+				e.write("two/config", "a = 4\n")
+				e.expectChange("a write in the new target")
+				e.settle()
+				e.write("one/config", "a = 5\n")
+				e.expectQuiet("a write in the old target")
+			},
+		},
+		{
+			name:  "directory mode ignores subdirectories",
+			rel:   "scripts",
+			dir:   true,
+			setup: func(e *watchEnv) { e.write("scripts/a.sh", "1") },
+			steps: func(e *watchEnv) {
+				must(e.t, os.Mkdir(filepath.Join(e.dir, "scripts", "sub"), 0o700))
+				e.expectQuiet("creating a subdirectory")
+			},
+		},
+		{
 			name:  "directory mode",
 			rel:   "scripts",
 			dir:   true,
@@ -265,6 +313,37 @@ func TestWatchDebounce(t *testing.T) {
 			case <-out:
 				t.Fatal("a burst of writes was reported more than once")
 			case <-time.After(quiet):
+			}
+		})
+	}
+}
+
+// An atomic save is one change: nothing is reported again when the watcher
+// looks at the files later.
+func TestWatchReportsASaveOnce(t *testing.T) {
+	for _, bc := range backends() {
+		t.Run(bc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config")
+			must(t, os.WriteFile(path, []byte("a = 1\n"), 0o600))
+			out := make(chan struct{}, 10)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ready := make(chan struct{})
+			go func() {
+				_ = Watch(ctx, path, WatchOptions{Poll: bc.poll, Debounce: 20 * time.Millisecond, Ready: ready}, out)
+			}()
+			<-ready
+			must(t, WriteFile(path, []byte("a = 2\n"), 0o600))
+			select {
+			case <-out:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no change reported")
+			}
+			select {
+			case <-out:
+				t.Fatal("one save was reported twice")
+			case <-time.After(retryMissing + 500*time.Millisecond):
 			}
 		})
 	}

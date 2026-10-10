@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// syncDir: Windows makes a rename durable with the file system journal.
+func syncDir(string) error { return nil }
+
 // rename retries while another process (an editor, an indexer, our own
 // watcher) holds the target open, which Windows reports as a sharing error.
 func rename(from, to string) error {

@@ -2,6 +2,7 @@ package kvconf
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -325,6 +326,43 @@ func TestSchemaErrors(t *testing.T) {
 			_, err := Unmarshal(nil, tt.target, Options{})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("err = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// leaky mimics a third-party type whose errors quote the input.
+type leaky string
+
+func (l *leaky) UnmarshalText(b []byte) error { return fmt.Errorf("bad input %q", b) }
+
+// explained returns a ValueError, which is shown.
+type explained string
+
+func (e *explained) UnmarshalText([]byte) error { return ValueError("must be a colour") }
+
+func TestDecodeNeverLeaksValues(t *testing.T) {
+	type cfg struct {
+		L     leaky     `kv:"l"`
+		E     explained `kv:"e"`
+		Ratio float64   `kv:"ratio" min:"0" max:"1"`
+		Any   float64   `kv:"any"`
+	}
+	tests := []struct{ in, want string }{
+		{"l = hunter2", "line 1: l: invalid kvconf.leaky"},
+		{"e = hunter2", "line 1: e: must be a colour"},
+		{"ratio = NaN", "line 1: ratio: must be a finite number"},
+		{"ratio = +Inf", "line 1: ratio: must be a finite number"},
+		{"any = NaN", "line 1: any: must be a finite number"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			var c cfg
+			w, err := Unmarshal([]byte(tt.in+"\n"), &c, Options{})
+			must(t, err)
+			eq(t, warningStrings(w), []string{tt.want})
+			if strings.Contains(tt.want, "hunter2") {
+				t.Fatal("value leaked")
 			}
 		})
 	}

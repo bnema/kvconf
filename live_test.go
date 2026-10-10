@@ -202,6 +202,18 @@ func TestLive(t *testing.T) {
 			},
 		},
 		{
+			name:    "repeated key with an invalid last value",
+			initial: ptr("after = 5s\nafter = bad\n"),
+			steps: func(t *testing.T, path string, l *Live[liveConfig], r *liveRecorder) {
+				eq(t, l.Get().After, 5*time.Second)
+				must(t, WriteFile(path, []byte("after = 6s\nafter = bad\n"), 0o600))
+				r.wait(t, "a change of the valid value")
+				eq(t, l.Get().After, 6*time.Second)
+				c, _ := r.last()
+				eq(t, c.Keys, []string{"after"})
+			},
+		},
+		{
 			name:    "warnings are reported with the change",
 			initial: ptr("after = 1s\n"),
 			steps: func(t *testing.T, path string, l *Live[liveConfig], r *liveRecorder) {
@@ -248,6 +260,18 @@ func TestLiveSeesSaveBetweenOpenAndRun(t *testing.T) {
 	go func() { _ = l.Run(ctx) }()
 	r.wait(t, "a save before Run")
 	eq(t, l.Get().Theme, "light")
+}
+
+func TestLiveRunTwice(t *testing.T) {
+	l, _, err := Open(filepath.Join(t.TempDir(), "config"), LiveOptions[liveConfig]{})
+	must(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = l.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	if err := l.Run(ctx); err == nil {
+		t.Fatal("a second Run was accepted")
+	}
 }
 
 func TestLiveConcurrentGet(t *testing.T) {

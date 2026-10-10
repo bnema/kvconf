@@ -113,6 +113,8 @@ func BenchmarkSet(b *testing.B) {
 	values := map[string]*string{"output.DP-3.scale": ptr("2")}
 	b.ReportAllocs()
 	for b.Loop() {
-		Set(benchFile, values)
+		if _, err := Set(benchFile, values); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
