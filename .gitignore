@@ -1,0 +1,4 @@
+.worktrees/
+*.test
+*.prof
+testdata/fuzz/

@@ -1,0 +1,10 @@
+version: "2"
+linters:
+  settings:
+    errcheck:
+      # Best-effort cleanup of descriptors and events: nothing to report.
+      exclude-functions:
+        - syscall.Close
+        - syscall.CloseHandle
+        - (*os.File).Close
+        - (*syscall.LazyProc).Call
