@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -23,21 +24,44 @@ func Quote(v string) string {
 }
 
 func needsQuote(v string) bool {
-	if v == "" || v != strings.TrimSpace(v) {
+	if v == "" {
 		return true
 	}
-	if v[0] == '"' || v[0] == '\'' {
+	first, last := v[0], v[len(v)-1]
+	if first >= utf8.RuneSelf || last >= utf8.RuneSelf {
+		if v != strings.TrimSpace(v) {
+			return true
+		}
+	} else if asciiSpace(first) || asciiSpace(last) {
+		return true
+	}
+	if first == '"' || first == '\'' {
 		return true // it would be unquoted on reading
+	}
+	hash := false
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case '\n', '\r':
+			return true
+		case '#':
+			hash = true
+		}
 	}
 	// A '#' after a space ends the value unless it is inside a quoted word,
 	// so quote any value where Parse would cut it.
-	return strings.ContainsAny(v, "\n\r") || stripComment(v, CommentSpaced) != v
+	return hash && stripComment(v, CommentSpaced) != v
+}
+
+// asciiSpace reports the ASCII bytes that strings.TrimSpace removes.
+func asciiSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
 }
 
 // validKey reports whether key can be written and read back as one key.
+// A leading U+FEFF would be read as the byte order mark of a first line.
 func validKey(key string) bool {
 	return key != "" && key[0] != '#' && key == strings.TrimSpace(key) &&
-		!strings.ContainsAny(key, "=\n\r")
+		!strings.HasPrefix(key, "\ufeff") && !strings.ContainsAny(key, "=\n\r")
 }
 
 func appendQuoted(b []byte, v string) []byte {
@@ -58,7 +82,27 @@ func Marshal(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := marshaler{b: make([]byte, 0, 32*len(s.order))}
+	// Size the output once: about 24 bytes of value per line.
+	size, maxLen := 0, 0
+	for _, f := range s.order {
+		if f.elem == nil && f.val == nil {
+			size += len(f.key) + 24
+			continue
+		}
+		n := rv.FieldByIndex(f.index).Len()
+		maxLen = max(maxLen, n)
+		if f.elem == nil {
+			size += n * (2*len(f.key) + 24)
+			continue
+		}
+		for _, sub := range f.elem.order {
+			size += n * (len(f.key) + len(sub.key) + 32)
+		}
+	}
+	m := marshaler{b: make([]byte, 0, size), tmp: make([]byte, 0, 64)}
+	// Map names and their sort order, reused for every map.
+	names := make([]string, 0, maxLen)
+	order := make([]int, 0, maxLen)
 	for _, f := range s.order {
 		fv := rv.FieldByIndex(f.index)
 		if f.elem == nil && f.val == nil {
@@ -69,21 +113,22 @@ func Marshal(v any) ([]byte, error) {
 		}
 		// Copy the map out once, into reused values, then sort by name.
 		n := fv.Len()
-		names := make([]string, 0, n)
+		names, order = names[:0], order[:0]
 		vals := reflect.MakeSlice(reflect.SliceOf(f.typ.Elem()), n, n)
 		key := reflect.New(f.typ.Key()).Elem()
 		for it, i := fv.MapRange(), 0; it.Next(); i++ {
 			key.SetIterKey(it)
 			names = append(names, key.String())
+			order = append(order, i)
 			vals.Index(i).SetIterValue(it)
-		}
-		order := make([]int, n)
-		for i := range order {
-			order[i] = i
 		}
 		slices.SortFunc(order, func(a, b int) int { return strings.Compare(names[a], names[b]) })
 		for _, i := range order {
 			name, ev := names[i], vals.Index(i)
+			// Checked in name order, so the error is the same on every run.
+			if strings.ContainsAny(name, "=\n\r") || name != strings.TrimSpace(name) {
+				return nil, fmt.Errorf("kvconf: %s: invalid map name %q", f.key, name)
+			}
 			if f.elem == nil {
 				if err := m.line(f.key, name, "", ev, f.val); err != nil {
 					return nil, err
@@ -136,9 +181,6 @@ func (m *marshaler) raw(key, value string) error {
 // line writes prefix+name[.sub] = value.
 func (m *marshaler) line(prefix, name, sub string, v reflect.Value, f *field) error {
 	var err error
-	if name != "" && (strings.ContainsAny(name, "=\n\r") || name != strings.TrimSpace(name)) {
-		return fmt.Errorf("kvconf: %s: invalid map name %q", prefix, name)
-	}
 	if m.tmp, err = appendValue(m.tmp[:0], v, f); err != nil {
 		key := prefix + name
 		if sub != "" {

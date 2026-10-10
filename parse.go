@@ -15,6 +15,7 @@ package kvconf
 
 import (
 	"errors"
+	"hash/maphash"
 	"io"
 	"slices"
 	"strconv"
@@ -132,6 +133,56 @@ func (p *problems) add(line int, key, msg string) bool {
 	return !p.strict
 }
 
+var dupSeed = maphash.MakeSeed()
+
+// duplicates reports each assignment of a key already assigned on an
+// earlier line, with the line it overrides. An open-addressing table of
+// entry indexes, on the stack for a config-sized file, is cheaper than a
+// map[string]int.
+func (p *problems) duplicates(entries []Entry) {
+	if len(entries) < 2 {
+		return
+	}
+	size := 1
+	for size < 2*len(entries) {
+		size <<= 1
+	}
+	var buf [512]int32 // 0: empty, else entry index + 1
+	var table []int32
+	if size <= len(buf) {
+		table = buf[:size]
+	} else {
+		table = make([]int32, size)
+	}
+	mask := uint32(size - 1)
+	syntax := len(p.list)
+	for i := range entries {
+		key := entries[i].Key
+		// Seeded, so a crafted file cannot make every key collide.
+		h := uint32(maphash.String(dupSeed, key))
+		for slot := h & mask; ; slot = (slot + 1) & mask {
+			k := table[slot]
+			if k == 0 {
+				table[slot] = int32(i + 1)
+				break
+			}
+			if prev := &entries[k-1]; prev.Key == key {
+				p.list = append(p.list, Warning{Line: entries[i].Line, Key: key, Msg: "overrides line " + strconv.Itoa(prev.Line)})
+				table[slot] = int32(i + 1)
+				break
+			}
+		}
+	}
+	if len(p.list) == syntax {
+		return
+	}
+	// Warnings are reported in line order, merged with the syntax ones.
+	slices.SortStableFunc(p.list, func(a, b Warning) int { return a.Line - b.Line })
+	if p.strict {
+		p.list = p.list[:1]
+	}
+}
+
 func (p *problems) err() error {
 	if p.strict && len(p.list) > 0 {
 		return p.list[0]
@@ -176,10 +227,6 @@ func ParseBytes(data []byte, opts Options) ([]Entry, []Warning, error) {
 	// One copy: every key and value is a substring of it.
 	s := strings.TrimPrefix(string(data), "\ufeff")
 	entries := make([]Entry, 0, strings.Count(s, "="))
-	var seen map[string]int
-	if !opts.AllowDuplicates {
-		seen = make(map[string]int, cap(entries))
-	}
 	p := problems{strict: opts.Strict}
 	maxLine := opts.maxLine()
 	for n := 1; s != ""; n++ {
@@ -218,13 +265,11 @@ func ParseBytes(data []byte, opts Options) ([]Entry, []Warning, error) {
 		if !opts.RawValues {
 			value = unquote(value)
 		}
-		if seen != nil {
-			if prev, dup := seen[key]; dup && !p.add(n, key, "overrides line "+strconv.Itoa(prev)) {
-				break
-			}
-			seen[key] = n
-		}
 		entries = append(entries, Entry{Key: key, Value: value, Line: n})
+	}
+	if !opts.AllowDuplicates {
+		// entries stops at a strict failure: its duplicates come first.
+		p.duplicates(entries)
 	}
 	if err := p.err(); err != nil {
 		return nil, p.list, err
@@ -271,7 +316,8 @@ func unquote(v string) string {
 		if strings.IndexByte(inner, '\\') < 0 && strings.IndexByte(inner, '"') < 0 {
 			return inner // the common case, without allocating
 		}
-		if s, err := strconv.Unquote(v); err == nil {
+		// An escape such as \x80 could make invalid UTF-8: keep it as written.
+		if s, err := strconv.Unquote(v); err == nil && utf8.ValidString(s) {
 			return s
 		}
 	case '\'':

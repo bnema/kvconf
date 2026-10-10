@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,11 @@ g = spawn "foo bar"
 			want: []Entry{{"title", "it's fine", 1}, {"b", `say "x # y"`, 2}},
 		},
 		{
+			name: "escape making invalid UTF-8 is kept as written",
+			in:   `a = "\200"` + "\n",
+			want: []Entry{{"a", `"\200"`, 1}},
+		},
+		{
 			name: "raw values",
 			in:   `a = "x"` + "\n",
 			opts: Options{RawValues: true},
@@ -96,6 +102,12 @@ g = spawn "foo bar"
 			in:       "a = 1\na = 2\n",
 			want:     []Entry{{"a", "1", 1}, {"a", "2", 2}},
 			warnings: []string{"line 2: a: overrides line 1"},
+		},
+		{
+			name:     "duplicates and bad lines in line order",
+			in:       "a = 1\nb = 1\nnope\na = 2\n= x\nb = 2\na = 3\n",
+			want:     []Entry{{"a", "1", 1}, {"b", "1", 2}, {"a", "2", 4}, {"b", "2", 6}, {"a", "3", 7}},
+			warnings: []string{"line 3: expected key = value", "line 4: a: overrides line 1", "line 5: missing key", "line 6: b: overrides line 2", "line 7: a: overrides line 4"},
 		},
 		{
 			name: "duplicates allowed",
@@ -127,6 +139,20 @@ g = spawn "foo bar"
 			opts:     Options{Strict: true},
 			err:      "line 2: a: overrides line 1",
 			warnings: []string{"line 2: a: overrides line 1"},
+		},
+		{
+			name:     "strict duplicate before a bad line",
+			in:       "a = 1\na = 2\nnope\n",
+			opts:     Options{Strict: true},
+			err:      "line 2: a: overrides line 1",
+			warnings: []string{"line 2: a: overrides line 1"},
+		},
+		{
+			name:     "strict bad line before a duplicate",
+			in:       "a = 1\nnope\na = 2\n",
+			opts:     Options{Strict: true},
+			err:      "line 2: expected key = value",
+			warnings: []string{"line 2: expected key = value"},
 		},
 		{
 			name:     "long line",
@@ -208,8 +234,50 @@ func TestChanged(t *testing.T) {
 	}
 }
 
+// FuzzDuplicates checks the duplicate warnings against a map.
+func FuzzDuplicates(f *testing.F) {
+	for _, s := range []string{"a=1\na=2\nb=1\na=3\n", "x\n=1\na=1\na=1\n"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		all, syntax, err := ParseBytes([]byte(in), Options{AllowDuplicates: true})
+		if err != nil {
+			return
+		}
+		var want []string
+		seen := map[string]int{}
+		for _, e := range all {
+			if prev, ok := seen[e.Key]; ok {
+				want = append(want, Warning{Line: e.Line, Key: e.Key, Msg: "overrides line " + strconv.Itoa(prev)}.Error())
+			}
+			seen[e.Key] = e.Line
+		}
+		for _, w := range syntax {
+			want = append(want, w.Error())
+		}
+		_, got, _ := ParseBytes([]byte(in), Options{})
+		if !slices.IsSortedFunc(got, func(a, b Warning) int { return a.Line - b.Line }) {
+			t.Fatalf("warnings out of line order: %q", warningStrings(got))
+		}
+		// Strict fails on the first problem in line order.
+		_, _, err = ParseBytes([]byte(in), Options{Strict: true})
+		switch {
+		case len(got) == 0 && err != nil:
+			t.Fatalf("strict err = %v, lenient had no warning", err)
+		case len(got) > 0 && (err == nil || err.Error() != got[0].Error()):
+			t.Fatalf("strict err = %v, want %q", err, got[0].Error())
+		}
+		gotS := warningStrings(got)
+		slices.Sort(want)
+		slices.Sort(gotS)
+		if !slices.Equal(gotS, want) {
+			t.Fatalf("warnings = %q, want %q", gotS, want)
+		}
+	})
+}
+
 func FuzzParse(f *testing.F) {
-	for _, s := range []string{"a = 1\n", "a = \"x # y\" # c\n", "\ufeffa=b\r\n", "x\n=\n'"} {
+	for _, s := range []string{"a = 1\n", "a = \"x # y\" # c\n", "\ufeffa=b\r\n", "x\n=\n'", "\ufeff\ufeff=", `0="\200"`} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
@@ -217,7 +285,11 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			return
 		}
-		// Whatever was read can be written and read back the same.
+		// Whatever was read can be written and read back the same, except a
+		// key that Set refuses to write.
+		if slices.ContainsFunc(entries, func(e Entry) bool { return !validKey(e.Key) }) {
+			return
+		}
 		var data []byte
 		for _, e := range entries {
 			data = append(data, e.Key+" = "+Quote(e.Value)+"\n"...)

@@ -74,10 +74,12 @@ type field struct {
 	maxText  string
 	oneof    []string
 	sep      string
-	item     *field  // element of a slice
-	val      *field  // element of a map of values
-	elem     *schema // element of a map of structs
-	defaults bool    // map element implements Defaulter
+	item     *field       // element of a slice
+	val      *field       // element of a map of values
+	elem     *schema      // element of a map of structs
+	defaults bool         // map element implements Defaulter
+	elems    reflect.Type // []element of a map of structs
+	slot     int          // index of a map field in schema.prefixes
 }
 
 type schema struct {
@@ -111,6 +113,9 @@ func buildSchema(t reflect.Type) (*schema, error) {
 		return nil, err
 	}
 	slices.SortStableFunc(s.prefixes, func(a, b *field) int { return len(b.key) - len(a.key) })
+	for i, f := range s.prefixes {
+		f.slot = i
+	}
 	return s, nil
 }
 
@@ -170,7 +175,7 @@ func (s *schema) add(t reflect.Type, prefix string, index []int) error {
 				if elem.catchAll != nil || len(elem.prefixes) > 0 {
 					return fmt.Errorf("kvconf: %s: a map element cannot hold maps or kv:\"*\"", where)
 				}
-				f = &field{elem: elem, defaults: reflect.PointerTo(et).Implements(defaulterType)}
+				f = &field{elem: elem, elems: reflect.SliceOf(et), defaults: reflect.PointerTo(et).Implements(defaulterType)}
 			}
 			f.key, f.index, f.typ = prefix+strings.TrimSuffix(name, "*"), idx, sf.Type
 			s.prefixes = append(s.prefixes, f)
@@ -287,9 +292,10 @@ func Decode(entries []Entry, v any, opts Options) ([]Warning, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := decodeState{root: rv.Elem()}
+	st := decodeState{root: rv.Elem(), entries: entries}
 	p := problems{strict: opts.Strict}
 	for i := range entries {
+		st.next = i
 		e := &entries[i]
 		msg, known := s.apply(&st, e)
 		if !known {
@@ -302,7 +308,7 @@ func Decode(entries []Entry, v any, opts Options) ([]Warning, error) {
 			return p.list, p.err()
 		}
 	}
-	st.flush()
+	st.flush(s)
 	if val, ok := v.(Validator); ok {
 		if err := val.Validate(); err != nil {
 			return p.list, err
@@ -314,66 +320,137 @@ func Decode(entries []Entry, v any, opts Options) ([]Warning, error) {
 // decodeState holds the scratch values of one Decode call, so a key of a
 // map does not allocate.
 type decodeState struct {
-	root reflect.Value
-	// scratch key and element per map field, reused for every entry.
-	keys, vals map[*field]reflect.Value
-	// pending struct elements, written back to their maps once at the end
-	// so each name is copied out of its map once, not once per key.
-	pending map[*field]map[string]*pendingElem
+	root    reflect.Value
+	entries []Entry
+	next    int        // index in entries of the entry being applied
+	maps    []mapState // by field.slot; nil until a key reaches a map
 }
 
-type pendingElem struct {
-	val reflect.Value
-	set bool // at least one key was accepted
+// mapState decodes the keys of one kv:"x.*" field.
+type mapState struct {
+	m        reflect.Value     // the map field; a map of values is created on first use
+	plain    map[string]string // m, for the map[string]string fast path
+	hint     int               // upper bound of the keys reaching it, to size its storage once
+	key, val reflect.Value     // scratch, reused for every entry
+	// Struct elements are decoded in elems, then written back once by
+	// flush, so each name is copied out of the map once, not once per key.
+	elems reflect.Value // []element
+	names []pendingName // names[i] is elems[i]
+	index map[string]int
 }
 
-func (st *decodeState) scratch(f *field) (key, val reflect.Value) {
-	if st.keys == nil {
-		st.keys, st.vals = map[*field]reflect.Value{}, map[*field]reflect.Value{}
-	}
-	key, ok := st.keys[f]
-	if !ok {
-		key = reflect.New(f.typ.Key()).Elem()
-		val = reflect.New(f.typ.Elem()).Elem()
-		st.keys[f], st.vals[f] = key, val
-	}
-	return key, st.vals[f]
+type pendingName struct {
+	name string
+	set  bool // at least one key was accepted
 }
 
-// element returns the addressable pending element name of the map field f.
-func (st *decodeState) element(f *field, m reflect.Value, name string) *pendingElem {
-	if st.pending == nil {
-		st.pending = map[*field]map[string]*pendingElem{}
+const (
+	// linearNames is how many names are searched linearly before index
+	// is built.
+	linearNames = 16
+	// maxElemHint caps the elements of a map of structs allocated up front.
+	maxElemHint = 64
+)
+
+// mapFor returns the state of the map field f. The first call sets every
+// map's hint from the entries left, so a config without map keys never
+// counts. A key is counted for every prefix it starts with, so a key that
+// apply passes on to a shorter prefix is counted there.
+func (st *decodeState) mapFor(s *schema, f *field) *mapState {
+	if st.maps == nil {
+		st.maps = make([]mapState, len(s.prefixes))
+		for i := st.next; i < len(st.entries); i++ {
+			key := st.entries[i].Key
+			for _, p := range s.prefixes {
+				if len(key) > len(p.key) && key[:len(p.key)] == p.key {
+					st.maps[p.slot].hint++
+				}
+			}
+		}
 	}
-	byName := st.pending[f]
-	if byName == nil {
-		byName = map[string]*pendingElem{}
-		st.pending[f] = byName
+	ms := &st.maps[f.slot]
+	if !ms.m.IsValid() {
+		ms.m = st.root.FieldByIndex(f.index)
+		if f.elem != nil {
+			// A name sets some of its fields: guess half of them per name,
+			// capped, as elements are whole structs. elems grows if needed.
+			ms.hint = min(2*ms.hint/max(len(f.elem.order), 1)+1, maxElemHint)
+		}
+		if ms.m.IsNil() {
+			// Created even if every key is rejected, as before a strict error.
+			// A map of structs gets its names in flush: hint is only a guess.
+			size := ms.hint
+			if f.elem != nil {
+				size = 0
+			}
+			ms.m.Set(reflect.MakeMapWithSize(f.typ, size))
+		}
+		if f.elem == nil {
+			if f.typ == stringMapType && f.val.plain() {
+				ms.plain = ms.m.Interface().(map[string]string)
+			} else {
+				ms.val = reflect.New(f.typ.Elem()).Elem()
+			}
+		}
+		if ms.plain == nil {
+			ms.key = reflect.New(f.typ.Key()).Elem()
+		}
 	}
-	if p, ok := byName[name]; ok {
-		return p
+	return ms
+}
+
+// element returns the index in ms.elems of the pending element name.
+func (ms *mapState) element(f *field, name string) int {
+	if ms.index != nil {
+		if i, ok := ms.index[name]; ok {
+			return i
+		}
+	} else {
+		for i := range ms.names {
+			if ms.names[i].name == name {
+				return i
+			}
+		}
 	}
-	p := &pendingElem{val: reflect.New(f.typ.Elem()).Elem()}
-	key, _ := st.scratch(f)
-	key.SetString(name)
-	if cur := m.MapIndex(key); cur.IsValid() {
-		p.val.Set(cur)
+	i := len(ms.names)
+	if !ms.elems.IsValid() {
+		ms.elems = reflect.MakeSlice(f.elems, ms.hint, ms.hint)
+		ms.names = make([]pendingName, 0, ms.hint)
+	} else if i == ms.elems.Len() {
+		grown := reflect.MakeSlice(f.elems, 2*i, 2*i)
+		reflect.Copy(grown, ms.elems)
+		ms.elems = grown
+	}
+	ms.names = append(ms.names, pendingName{name: name})
+	if ms.index != nil {
+		ms.index[name] = i
+	} else if len(ms.names) > linearNames {
+		ms.index = make(map[string]int, ms.hint)
+		for j, p := range ms.names {
+			ms.index[p.name] = j
+		}
+	}
+	ev := ms.elems.Index(i)
+	ms.key.SetString(name)
+	if cur := ms.m.MapIndex(ms.key); cur.IsValid() {
+		ev.Set(cur)
 	} else if f.defaults {
-		p.val.Addr().Interface().(Defaulter).SetDefaults()
+		ev.Addr().Interface().(Defaulter).SetDefaults()
 	}
-	byName[name] = p
-	return p
+	return i
 }
 
 // flush writes the pending struct elements back to their maps.
-func (st *decodeState) flush() {
-	for f, byName := range st.pending {
-		m := st.root.FieldByIndex(f.index)
-		key, _ := st.scratch(f)
-		for name, p := range byName {
+func (st *decodeState) flush(s *schema) {
+	for slot := range st.maps {
+		ms, f := &st.maps[slot], s.prefixes[slot]
+		if f.elem == nil || !ms.m.IsValid() {
+			continue
+		}
+		for i, p := range ms.names {
 			if p.set {
-				key.SetString(name)
-				m.SetMapIndex(key, p.val)
+				ms.key.SetString(p.name)
+				ms.m.SetMapIndex(ms.key, ms.elems.Index(i))
 			}
 		}
 	}
@@ -404,26 +481,22 @@ func (s *schema) apply(st *decodeState, e *Entry) (msg string, known bool) {
 				continue
 			}
 		}
-		m := root.FieldByIndex(f.index)
-		if m.IsNil() {
-			m.Set(reflect.MakeMap(f.typ))
-		}
+		ms := st.mapFor(s, f)
 		if sub != nil {
 			// A name whose every key is rejected is not created.
-			p := st.element(f, m, name)
-			if msg = sub.set(p.val.FieldByIndex(sub.index), e.Value); msg == "" {
-				p.set = true
+			i := ms.element(f, name)
+			if msg = sub.set(ms.elems.Index(i).FieldByIndex(sub.index), e.Value); msg == "" {
+				ms.names[i].set = true
 			}
 			return msg, true
 		}
-		if f.typ == stringMapType && f.val.plain() {
-			m.Interface().(map[string]string)[name] = e.Value
+		if ms.plain != nil {
+			ms.plain[name] = e.Value
 			return "", true
 		}
-		key, val := st.scratch(f)
-		if msg = f.val.set(val, e.Value); msg == "" {
-			key.SetString(name)
-			m.SetMapIndex(key, val)
+		if msg = f.val.set(ms.val, e.Value); msg == "" {
+			ms.key.SetString(name)
+			ms.m.SetMapIndex(ms.key, ms.val)
 		}
 		return msg, true
 	}

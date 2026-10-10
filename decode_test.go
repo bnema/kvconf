@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -227,6 +228,94 @@ dir = rel/path
 			}
 		})
 	}
+}
+
+type nestedMaps struct {
+	All     map[string]string `kv:"m.*"`
+	Outputs map[string]output `kv:"m.out.*"`
+}
+
+func TestDecodeMaps(t *testing.T) {
+	// One key per name: more names than the element hint guesses, past the
+	// linear search.
+	var many strings.Builder
+	want := map[string]output{}
+	for i := range 3 * maxElemHint {
+		name := "o" + strconv.Itoa(i)
+		fmt.Fprintf(&many, "output.%s.hdr = on\n", name)
+		want[name] = output{Scale: 1, HDR: true, Bright: 203}
+	}
+	tests := []struct {
+		name  string
+		in    string
+		opts  Options
+		start func(c *testConfig)
+		check func(t *testing.T, c *testConfig)
+		err   bool
+	}{
+		{
+			name:  "many names",
+			in:    many.String(),
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, want) },
+		},
+		{
+			name:  "one name, many keys",
+			in:    strings.Repeat("output.x.scale = 2\n", 200),
+			opts:  Options{AllowDuplicates: true},
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{"x": {Scale: 2, Bright: 203}}) },
+		},
+		{
+			name:  "map reached before a strict error exists",
+			in:    "output.x.scale = 2\ncount = bad\n",
+			opts:  Options{Strict: true},
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{}) },
+			err:   true,
+		},
+		{
+			name: "existing elements are updated, not reset",
+			in:   "output.A.hdr = on\noutput.B.scale = 3\nbind.x = y\n",
+			start: func(c *testConfig) {
+				c.Outputs = map[string]output{"A": {Scale: 2, Bright: 100}, "C": {Scale: 1}}
+				c.Binds = map[string]string{"keep": "me"}
+			},
+			check: func(t *testing.T, c *testConfig) {
+				eq(t, c.Outputs, map[string]output{
+					"A": {Scale: 2, HDR: true, Bright: 100},
+					"B": {Scale: 3, Bright: 203},
+					"C": {Scale: 1},
+				})
+				eq(t, c.Binds, map[string]string{"keep": "me", "x": "y"})
+			},
+		},
+		{
+			name:  "rejected element leaves an existing map untouched",
+			in:    "output.A.scale = 9\n",
+			start: func(c *testConfig) { c.Outputs = map[string]output{"A": {Scale: 2}} },
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{"A": {Scale: 2}}) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := defaults()
+			if tt.start != nil {
+				tt.start(&c)
+			}
+			_, err := Unmarshal([]byte(tt.in), &c, tt.opts)
+			if (err != nil) != tt.err {
+				t.Fatalf("err = %v", err)
+			}
+			tt.check(t, &c)
+		})
+	}
+
+	t.Run("key matching two prefixes", func(t *testing.T) {
+		// m.out.x.nope is no output field, so m.* takes it.
+		var n nestedMaps
+		_, err := Unmarshal([]byte("m.out.x.scale = 2\nm.out.x.nope = 1\nm.a = b\n"), &n, Options{})
+		must(t, err)
+		eq(t, n.Outputs, map[string]output{"x": {Scale: 2, Bright: 203}})
+		eq(t, n.All, map[string]string{"out.x.nope": "1", "a": "b"})
+	})
 }
 
 type plain struct {
