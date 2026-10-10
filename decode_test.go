@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -227,6 +228,75 @@ dir = rel/path
 			}
 		})
 	}
+}
+
+type nestedMaps struct {
+	All     map[string]string `kv:"m.*"`
+	Outputs map[string]output `kv:"m.out.*"`
+}
+
+func TestDecodeMaps(t *testing.T) {
+	var many strings.Builder
+	want := map[string]output{}
+	for i := range 40 { // past the linear search, twice per name
+		name := "o" + strconv.Itoa(i)
+		fmt.Fprintf(&many, "output.%s.scale = 2\noutput.%s.hdr = on\n", name, name)
+		want[name] = output{Scale: 2, HDR: true, Bright: 203}
+	}
+	tests := []struct {
+		name  string
+		in    string
+		start func(c *testConfig)
+		check func(t *testing.T, c *testConfig)
+	}{
+		{
+			name:  "many names",
+			in:    many.String(),
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, want) },
+		},
+		{
+			name: "existing elements are updated, not reset",
+			in:   "output.A.hdr = on\noutput.B.scale = 3\nbind.x = y\n",
+			start: func(c *testConfig) {
+				c.Outputs = map[string]output{"A": {Scale: 2, Bright: 100}, "C": {Scale: 1}}
+				c.Binds = map[string]string{"keep": "me"}
+			},
+			check: func(t *testing.T, c *testConfig) {
+				eq(t, c.Outputs, map[string]output{
+					"A": {Scale: 2, HDR: true, Bright: 100},
+					"B": {Scale: 3, Bright: 203},
+					"C": {Scale: 1},
+				})
+				eq(t, c.Binds, map[string]string{"keep": "me", "x": "y"})
+			},
+		},
+		{
+			name:  "rejected element leaves an existing map untouched",
+			in:    "output.A.scale = 9\n",
+			start: func(c *testConfig) { c.Outputs = map[string]output{"A": {Scale: 2}} },
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{"A": {Scale: 2}}) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := defaults()
+			if tt.start != nil {
+				tt.start(&c)
+			}
+			_, err := Unmarshal([]byte(tt.in), &c, Options{})
+			must(t, err)
+			tt.check(t, &c)
+		})
+	}
+
+	t.Run("key matching two prefixes", func(t *testing.T) {
+		// m.out.x.nope is no output field, so m.* takes it.
+		var n nestedMaps
+		_, err := Unmarshal([]byte("m.out.x.scale = 2\nm.out.x.nope = 1\nm.a = b\n"), &n, Options{})
+		must(t, err)
+		eq(t, n.Outputs, map[string]output{"x": {Scale: 2, Bright: 203}})
+		eq(t, n.All, map[string]string{"out.x.nope": "1", "a": "b"})
+	})
 }
 
 type plain struct {

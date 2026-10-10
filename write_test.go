@@ -81,7 +81,7 @@ func TestSet(t *testing.T) {
 }
 
 func TestSetRejectsInjection(t *testing.T) {
-	for _, key := range []string{"", "a = b", "a\nadmin", "bind.q = y\nadmin", "# a", " a"} {
+	for _, key := range []string{"", "a = b", "a\nadmin", "bind.q = y\nadmin", "# a", " a", "\ufeffa"} {
 		t.Run(key, func(t *testing.T) {
 			if _, err := Set(nil, map[string]*string{key: ptr("v")}); err == nil {
 				t.Fatalf("Set accepted key %q", key)
