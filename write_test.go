@@ -106,6 +106,15 @@ func TestMarshalRejectsInjection(t *testing.T) {
 			}
 		})
 	}
+	t.Run("first invalid name in order", func(t *testing.T) {
+		v := &marshalConfig{Binds: map[string]string{" d": "", " b": "", " a": "", " c": ""}}
+		for range 20 { // map order is random
+			_, err := Marshal(v)
+			if err == nil || err.Error() != `kvconf: bind.: invalid map name " a"` {
+				t.Fatalf("err = %v", err)
+			}
+		}
+	})
 }
 
 // upper marshals with a pointer receiver, like many TextMarshalers.

@@ -155,7 +155,7 @@ func (p *problems) duplicates(entries []Entry) {
 		table = make([]int32, size)
 	}
 	mask := uint32(size - 1)
-	var dups []Warning
+	syntax := len(p.list)
 	for i := range entries {
 		key := entries[i].Key
 		// Seeded, so a crafted file cannot make every key collide.
@@ -167,17 +167,16 @@ func (p *problems) duplicates(entries []Entry) {
 				break
 			}
 			if prev := &entries[k-1]; prev.Key == key {
-				dups = append(dups, Warning{Line: entries[i].Line, Key: key, Msg: "overrides line " + strconv.Itoa(prev.Line)})
+				p.list = append(p.list, Warning{Line: entries[i].Line, Key: key, Msg: "overrides line " + strconv.Itoa(prev.Line)})
 				table[slot] = int32(i + 1)
 				break
 			}
 		}
 	}
-	if len(dups) == 0 {
+	if len(p.list) == syntax {
 		return
 	}
 	// Warnings are reported in line order, merged with the syntax ones.
-	p.list = append(p.list, dups...)
 	slices.SortStableFunc(p.list, func(a, b Warning) int { return a.Line - b.Line })
 	if p.strict {
 		p.list = p.list[:1]

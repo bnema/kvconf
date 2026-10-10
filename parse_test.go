@@ -256,14 +256,22 @@ func FuzzDuplicates(f *testing.F) {
 			want = append(want, w.Error())
 		}
 		_, got, _ := ParseBytes([]byte(in), Options{})
+		if !slices.IsSortedFunc(got, func(a, b Warning) int { return a.Line - b.Line }) {
+			t.Fatalf("warnings out of line order: %q", warningStrings(got))
+		}
+		// Strict fails on the first problem in line order.
+		_, _, err = ParseBytes([]byte(in), Options{Strict: true})
+		switch {
+		case len(got) == 0 && err != nil:
+			t.Fatalf("strict err = %v, lenient had no warning", err)
+		case len(got) > 0 && (err == nil || err.Error() != got[0].Error()):
+			t.Fatalf("strict err = %v, want %q", err, got[0].Error())
+		}
 		gotS := warningStrings(got)
 		slices.Sort(want)
 		slices.Sort(gotS)
 		if !slices.Equal(gotS, want) {
 			t.Fatalf("warnings = %q, want %q", gotS, want)
-		}
-		if !slices.IsSortedFunc(got, func(a, b Warning) int { return a.Line - b.Line }) {
-			t.Fatalf("warnings out of line order: %q", warningStrings(got))
 		}
 	})
 }

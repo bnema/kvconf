@@ -236,23 +236,40 @@ type nestedMaps struct {
 }
 
 func TestDecodeMaps(t *testing.T) {
+	// One key per name: more names than the element hint guesses, past the
+	// linear search.
 	var many strings.Builder
 	want := map[string]output{}
-	for i := range 40 { // past the linear search, twice per name
+	for i := range 3 * maxElemHint {
 		name := "o" + strconv.Itoa(i)
-		fmt.Fprintf(&many, "output.%s.scale = 2\noutput.%s.hdr = on\n", name, name)
-		want[name] = output{Scale: 2, HDR: true, Bright: 203}
+		fmt.Fprintf(&many, "output.%s.hdr = on\n", name)
+		want[name] = output{Scale: 1, HDR: true, Bright: 203}
 	}
 	tests := []struct {
 		name  string
 		in    string
+		opts  Options
 		start func(c *testConfig)
 		check func(t *testing.T, c *testConfig)
+		err   bool
 	}{
 		{
 			name:  "many names",
 			in:    many.String(),
 			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, want) },
+		},
+		{
+			name:  "one name, many keys",
+			in:    strings.Repeat("output.x.scale = 2\n", 200),
+			opts:  Options{AllowDuplicates: true},
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{"x": {Scale: 2, Bright: 203}}) },
+		},
+		{
+			name:  "map reached before a strict error exists",
+			in:    "output.x.scale = 2\ncount = bad\n",
+			opts:  Options{Strict: true},
+			check: func(t *testing.T, c *testConfig) { eq(t, c.Outputs, map[string]output{}) },
+			err:   true,
 		},
 		{
 			name: "existing elements are updated, not reset",
@@ -283,8 +300,10 @@ func TestDecodeMaps(t *testing.T) {
 			if tt.start != nil {
 				tt.start(&c)
 			}
-			_, err := Unmarshal([]byte(tt.in), &c, Options{})
-			must(t, err)
+			_, err := Unmarshal([]byte(tt.in), &c, tt.opts)
+			if (err != nil) != tt.err {
+				t.Fatalf("err = %v", err)
+			}
 			tt.check(t, &c)
 		})
 	}

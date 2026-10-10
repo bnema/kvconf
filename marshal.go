@@ -118,17 +118,17 @@ func Marshal(v any) ([]byte, error) {
 		key := reflect.New(f.typ.Key()).Elem()
 		for it, i := fv.MapRange(), 0; it.Next(); i++ {
 			key.SetIterKey(it)
-			name := key.String()
-			if strings.ContainsAny(name, "=\n\r") || name != strings.TrimSpace(name) {
-				return nil, fmt.Errorf("kvconf: %s: invalid map name %q", f.key, name)
-			}
-			names = append(names, name)
+			names = append(names, key.String())
 			order = append(order, i)
 			vals.Index(i).SetIterValue(it)
 		}
 		slices.SortFunc(order, func(a, b int) int { return strings.Compare(names[a], names[b]) })
 		for _, i := range order {
 			name, ev := names[i], vals.Index(i)
+			// Checked in name order, so the error is the same on every run.
+			if strings.ContainsAny(name, "=\n\r") || name != strings.TrimSpace(name) {
+				return nil, fmt.Errorf("kvconf: %s: invalid map name %q", f.key, name)
+			}
 			if f.elem == nil {
 				if err := m.line(f.key, name, "", ev, f.val); err != nil {
 					return nil, err

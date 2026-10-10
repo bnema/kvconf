@@ -344,8 +344,13 @@ type pendingName struct {
 	set  bool // at least one key was accepted
 }
 
-// linearNames is how many names are searched linearly before index is built.
-const linearNames = 16
+const (
+	// linearNames is how many names are searched linearly before index
+	// is built.
+	linearNames = 16
+	// maxElemHint caps the elements of a map of structs allocated up front.
+	maxElemHint = 64
+)
 
 // mapFor returns the state of the map field f. The first call sets every
 // map's hint from the entries left, so a config without map keys never
@@ -366,10 +371,21 @@ func (st *decodeState) mapFor(s *schema, f *field) *mapState {
 	ms := &st.maps[f.slot]
 	if !ms.m.IsValid() {
 		ms.m = st.root.FieldByIndex(f.index)
-		if f.elem == nil {
-			if ms.m.IsNil() {
-				ms.m.Set(reflect.MakeMapWithSize(f.typ, ms.hint))
+		if f.elem != nil {
+			// A name sets some of its fields: guess half of them per name,
+			// capped, as elements are whole structs. elems grows if needed.
+			ms.hint = min(2*ms.hint/max(len(f.elem.order), 1)+1, maxElemHint)
+		}
+		if ms.m.IsNil() {
+			// Created even if every key is rejected, as before a strict error.
+			// A map of structs gets its names in flush: hint is only a guess.
+			size := ms.hint
+			if f.elem != nil {
+				size = 0
 			}
+			ms.m.Set(reflect.MakeMapWithSize(f.typ, size))
+		}
+		if f.elem == nil {
 			if f.typ == stringMapType && f.val.plain() {
 				ms.plain = ms.m.Interface().(map[string]string)
 			} else {
@@ -398,9 +414,12 @@ func (ms *mapState) element(f *field, name string) int {
 	}
 	i := len(ms.names)
 	if !ms.elems.IsValid() {
-		// Every name comes from a key counted in hint: elems never grows.
 		ms.elems = reflect.MakeSlice(f.elems, ms.hint, ms.hint)
 		ms.names = make([]pendingName, 0, ms.hint)
+	} else if i == ms.elems.Len() {
+		grown := reflect.MakeSlice(f.elems, 2*i, 2*i)
+		reflect.Copy(grown, ms.elems)
+		ms.elems = grown
 	}
 	ms.names = append(ms.names, pendingName{name: name})
 	if ms.index != nil {
@@ -421,22 +440,12 @@ func (ms *mapState) element(f *field, name string) int {
 	return i
 }
 
-// flush writes the pending struct elements back to their maps. A map that
-// a key reached exists afterwards, even when every key was rejected.
+// flush writes the pending struct elements back to their maps.
 func (st *decodeState) flush(s *schema) {
 	for slot := range st.maps {
 		ms, f := &st.maps[slot], s.prefixes[slot]
 		if f.elem == nil || !ms.m.IsValid() {
 			continue
-		}
-		if ms.m.IsNil() {
-			n := 0
-			for _, p := range ms.names {
-				if p.set {
-					n++
-				}
-			}
-			ms.m.Set(reflect.MakeMapWithSize(f.typ, n))
 		}
 		for i, p := range ms.names {
 			if p.set {
