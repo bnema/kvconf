@@ -110,18 +110,18 @@ skips saves that change no value.
 
 ## Performance
 
-Measured at `v0.1.0` (`3b1b6ef`, 2026-10-10) with Go 1.27.1 on linux/amd64
+Measured at `v0.1.1` (`ebc8127`, 2026-10-10) with Go 1.27.1 on linux/amd64
 with an AMD Ryzen 9 7900X3D. Values are medians of 6 runs. The input is a
 realistic ~2.9 KB config of 100 lines with comments, 60 binds and 8 outputs.
 
 | Benchmark | Time/op | Throughput | Bytes/op | Allocs/op |
 |---|---:|---:|---:|---:|
-| `Parse` (file to entries) | 3.9 µs | 755 MB/s | 10.4 KiB | 5 |
-| `Unmarshal` (file to struct, maps included) | 12.5 µs | 232 MB/s | 21.7 KiB | 47 |
-| `Decode` (5 scalar entries) | 177 ns | | 112 B | 1 |
+| `Parse` (file to entries) | 3.9 µs | 744 MB/s | 10.4 KiB | 5 |
+| `Unmarshal` (file to struct, maps included) | 12.2 µs | 238 MB/s | 21.7 KiB | 47 |
+| `Decode` (5 scalar entries) | 171 ns | | 112 B | 1 |
 | `Marshal` (struct to file) | 11.6 µs | | 15.5 KiB | 19 |
-| `Set` (edit one key in place) | 2.4 µs | | 10.5 KiB | 5 |
-| `Watch` (one write to one report, inotify) | 5.5 µs | | 256 B | 2 |
+| `Set` (edit one key in place) | 2.5 µs | | 10.5 KiB | 5 |
+| `Watch` (one write to one report, inotify) | 5.3 µs | | 256 B | 2 |
 
 Reproduce with:
 
