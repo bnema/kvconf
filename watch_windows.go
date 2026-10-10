@@ -8,8 +8,8 @@ import (
 	"unsafe"
 )
 
-// The standard syscall package lacks these, or declares them with a wrong
-// signature on 64-bit Windows; they are loaded from kernel32 directly.
+// These functions are missing from package syscall: they are loaded from
+// kernel32 directly.
 var (
 	kernel32                   = syscall.NewLazyDLL("kernel32.dll")
 	procCreateEventW           = kernel32.NewProc("CreateEventW")
@@ -58,9 +58,6 @@ func createEvent() (syscall.Handle, error) {
 }
 
 func newNative() (backend, error) {
-	if err := procWaitForMultipleObjects.Find(); err != nil {
-		return nil, nil // poll instead
-	}
 	ev, err := createEvent()
 	if err != nil {
 		return nil, err
@@ -186,7 +183,7 @@ func (w *winWatch) wait(timeout time.Duration, evs []event) ([]event, error) {
 			return evs, nil
 		}
 		// The directory was removed or became unreadable.
-		return append(evs, event{dir: d.dir, lost: true}), nil
+		return append(evs, event{}), nil
 	}
 	if n == 0 {
 		evs = append(evs, event{dir: d.dir}) // the buffer overflowed
@@ -203,7 +200,7 @@ func (w *winWatch) wait(timeout time.Duration, evs []event) ([]event, error) {
 		off += info.NextEntryOffset
 	}
 	if err := d.read(); err != nil {
-		evs = append(evs, event{dir: d.dir, lost: true})
+		evs = append(evs, event{})
 	}
 	return evs, nil
 }

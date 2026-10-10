@@ -123,7 +123,7 @@ func (in *inotify) wait(timeout time.Duration, evs []event) ([]event, error) {
 			if in.wds[dir] == ev.Wd {
 				delete(in.wds, dir)
 			}
-			evs = append(evs, event{dir: dir, lost: true})
+			evs = append(evs, event{})
 			continue
 		}
 		for len(name) > 0 && name[len(name)-1] == 0 {
