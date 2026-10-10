@@ -68,15 +68,13 @@ func Watch(ctx context.Context, path string, opts WatchOptions, out chan<- struc
 		b = newPoller(opts.Poll)
 	} else if b, err = newNative(); err != nil {
 		return err
-	} else if b == nil {
-		b = newPoller(time.Second)
 	}
 	defer b.close() //nolint:errcheck // nothing to report once watching ends
 	stop := context.AfterFunc(ctx, b.wake)
 	defer stop()
 
 	w := &watcher{path: path, dir: opts.Dir, stamps: map[string]stamp{}}
-	missing, err := w.rewatch(b)
+	missing, _, err := w.rewatchChanged(b)
 	if err != nil {
 		return err
 	}
@@ -189,10 +187,9 @@ func (t *target) has(name string) bool {
 
 // event is a change in a watched directory. An empty name means "something
 // changed in dir" (kqueue, polling, overflow); an empty dir means anything
-// may have changed. lost means the watch itself vanished.
+// may have changed, or a watch was lost.
 type event struct {
 	dir, name string
-	lost      bool
 	// moved: the name was created, removed or renamed, so a link may now
 	// point elsewhere. A plain write leaves links alone.
 	moved bool
@@ -329,11 +326,6 @@ func (w *watcher) plan() (targets []*target, files []string) {
 	return targets, files
 }
 
-func (w *watcher) rewatch(b backend) (missing bool, err error) {
-	missing, _, err = w.rewatchChanged(b)
-	return missing, err
-}
-
 // rewatchChanged installs the watches again and reports whether the watched
 // files changed meanwhile: a link was retargeted, a missing directory
 // appeared, or a file changed while it was not watched.
@@ -367,7 +359,7 @@ func sameTargets(a, b []*target) bool {
 func (w *watcher) classify(evs []event) (relevant, rewatch, recheck bool) {
 	relinked := false
 	for _, ev := range evs {
-		if ev.lost || ev.dir == "" {
+		if ev.dir == "" {
 			relevant, rewatch, recheck = true, true, true
 			continue
 		}

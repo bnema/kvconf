@@ -248,7 +248,8 @@ func stripComment(v string, style CommentStyle) string {
 				quote = 0
 			}
 		case (c == '"' || c == '\'') && (i == 0 || v[i-1] == ' ' || v[i-1] == '\t'):
-			// Only a quote that starts a word opens a string: it's stays text.
+			// Only a quote that starts a word opens a string: the quote in
+			// "it's" stays text.
 			quote = c
 		case c == '#' && (style == CommentAny || i > 0 && (v[i-1] == ' ' || v[i-1] == '\t')):
 			return strings.TrimSpace(v[:i])
@@ -306,10 +307,4 @@ func Changed(old, cur map[string]string) []string {
 	}
 	slices.Sort(keys)
 	return keys
-}
-
-// sameEntries reports whether two files assign the same values in the same
-// order, whatever their comments and spacing.
-func sameEntries(a, b []Entry) bool {
-	return slices.EqualFunc(a, b, func(x, y Entry) bool { return x.Key == y.Key && x.Value == y.Value })
 }

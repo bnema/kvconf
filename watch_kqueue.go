@@ -1,4 +1,4 @@
-//go:build darwin || ios || freebsd || netbsd || openbsd || dragonfly
+//go:build darwin || freebsd || netbsd || openbsd || dragonfly
 
 package kvconf
 
@@ -124,8 +124,11 @@ func (k *kqueue) wait(timeout time.Duration, evs []event) ([]event, error) {
 		if !ok {
 			continue
 		}
-		lost := ev.Fflags&(syscall.NOTE_DELETE|syscall.NOTE_RENAME|syscall.NOTE_REVOKE) != 0
-		evs = append(evs, event{dir: dir, lost: lost})
+		if ev.Fflags&(syscall.NOTE_DELETE|syscall.NOTE_RENAME|syscall.NOTE_REVOKE) != 0 {
+			evs = append(evs, event{}) // a watch was lost
+			continue
+		}
+		evs = append(evs, event{dir: dir})
 	}
 	return evs, nil
 }

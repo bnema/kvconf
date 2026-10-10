@@ -17,21 +17,25 @@ func Load[T any](path string, opts Options) (*T, []Warning, error) {
 	return cfg, warnings, err
 }
 
+// load returns nil entries, not an empty slice, when the file is missing.
 func load[T any](path string, opts Options) (*T, []Entry, []Warning, error) {
 	data, err := ReadFile(path, opts)
 	if err != nil {
 		if isNotExist(err) && !opts.RequireFile {
+			// No entries: the defaults, then Validate.
 			cfg := newDefault[T]()
-			if v, ok := any(cfg).(Validator); ok {
-				if err := v.Validate(); err != nil {
-					return nil, nil, nil, err
-				}
+			if _, err := Decode(nil, cfg, opts); err != nil {
+				return nil, nil, nil, err
 			}
 			return cfg, nil, nil, nil
 		}
 		return nil, nil, nil, err
 	}
-	return decodeFile[T](path, data, opts)
+	cfg, entries, warnings, err := decodeFile[T](path, data, opts)
+	if err == nil && entries == nil {
+		entries = []Entry{}
+	}
+	return cfg, entries, warnings, err
 }
 
 func decodeFile[T any](path string, data []byte, opts Options) (*T, []Entry, []Warning, error) {
@@ -84,6 +88,7 @@ type Live[T any] struct {
 	opts    LiveOptions[T]
 	cur     atomic.Pointer[T]
 	entries []Entry // owned by Run
+	exists  bool    // whether the file was there at the last load; owned by Run
 	running atomic.Bool
 }
 
@@ -94,7 +99,7 @@ func Open[T any](path string, opts LiveOptions[T]) (*Live[T], []Warning, error) 
 	if err != nil {
 		return nil, warnings, err
 	}
-	l := &Live[T]{path: path, opts: opts, entries: entries}
+	l := &Live[T]{path: path, opts: opts, entries: entries, exists: entries != nil}
 	l.cur.Store(cfg)
 	return l, warnings, nil
 }
@@ -113,8 +118,6 @@ func (l *Live[T]) Run(ctx context.Context) error {
 	if !l.running.CompareAndSwap(false, true) {
 		return errors.New("kvconf: Live.Run called twice")
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	changed := make(chan struct{}, 1)
 	ready := make(chan struct{})
 	wopts := l.opts.Watch
@@ -147,7 +150,8 @@ func (l *Live[T]) reload() {
 	if isNotExist(err) {
 		// Keep the current config: a removed file is often about to be
 		// replaced, and an empty config is rarely what the user meant.
-		if l.entries != nil {
+		if l.exists {
+			l.exists = false
 			l.report(fmt.Errorf("%s: %w", l.path, fs.ErrNotExist))
 		}
 		return
@@ -161,13 +165,14 @@ func (l *Live[T]) reload() {
 		l.report(err)
 		return
 	}
-	if sameEntries(entries, l.entries) {
-		return
-	}
+	l.exists = true
 	// Compare every assignment, not the last one: a repeated key whose
 	// last value is invalid decodes to an earlier one.
 	keys := changedKeys(l.entries, entries)
 	l.entries = entries
+	if len(keys) == 0 {
+		return
+	}
 	old := l.cur.Swap(cfg)
 	if l.opts.OnChange != nil {
 		l.opts.OnChange(Change[T]{Old: old, New: cfg, Keys: keys, Warnings: warnings})
@@ -200,7 +205,7 @@ func changedKeys(old, cur []Entry) []string {
 }
 
 func (l *Live[T]) report(err error) {
-	if l.opts.OnError != nil && !errors.Is(err, context.Canceled) {
+	if l.opts.OnError != nil {
 		l.opts.OnError(err)
 	}
 }

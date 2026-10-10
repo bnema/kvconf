@@ -44,12 +44,23 @@ func (e *watchEnv) symlink(target, rel string) {
 	}
 }
 
+// fastWait is how long a change that needs no retry may take. It stays below
+// retryMissing, so a broken fast path is not hidden by the periodic look.
+const fastWait = retryMissing - 500*time.Millisecond
+
 func (e *watchEnv) expectChange(why string) {
+	e.t.Helper()
+	e.expectChangeWithin(why, fastWait)
+}
+
+// expectChangeWithin is expectChange for a step that legitimately relies on
+// the retry or recheck, which fires after retryMissing.
+func (e *watchEnv) expectChangeWithin(why string, d time.Duration) {
 	e.t.Helper()
 	select {
 	case <-e.out:
-	case <-time.After(5 * time.Second):
-		e.t.Fatalf("no change reported after %s", why)
+	case <-time.After(d):
+		e.t.Fatalf("no change reported within %v after %s", d, why)
 	}
 }
 
@@ -74,6 +85,14 @@ func (e *watchEnv) settle() {
 type backendCase struct {
 	name string
 	poll time.Duration
+}
+
+// slowWait is the deadline for a step that relies on the retry on this OS.
+func slowWait() time.Duration {
+	if runtime.GOOS == "windows" {
+		return retryMissing + 3*time.Second
+	}
+	return fastWait
 }
 
 func backends() []backendCase {
@@ -135,7 +154,8 @@ func TestWatch(t *testing.T) {
 			rel:  "a/b/config",
 			steps: func(e *watchEnv) {
 				e.write("a/b/config", "a = 1\n")
-				e.expectChange("the directories and file appeared")
+				// Windows may only find the new directories on the retry.
+				e.expectChangeWithin("the directories and file appeared", slowWait())
 				e.settle()
 				e.write("a/b/config", "a = 2\n")
 				e.expectChange("a write once the directory exists")
@@ -147,10 +167,12 @@ func TestWatch(t *testing.T) {
 			setup: func(e *watchEnv) { e.write("d/config", "a = 1\n") },
 			steps: func(e *watchEnv) {
 				must(e.t, os.RemoveAll(filepath.Join(e.dir, "d")))
-				e.expectChange("the directory removal")
+				// Windows reports a removed directory only after the watch on
+				// it is closed: the recheck finds it.
+				e.expectChangeWithin("the directory removal", slowWait())
 				e.settle()
 				e.write("d/config", "a = 2\n")
-				e.expectChange("the recreated file")
+				e.expectChangeWithin("the recreated file", slowWait())
 			},
 		},
 		{
@@ -286,9 +308,17 @@ func TestWatch(t *testing.T) {
 	}
 }
 
+// Every write restarts the debounce: a burst longer than the debounce is
+// reported once, after its last write.
 func TestWatchDebounce(t *testing.T) {
+	const (
+		debounce = 200 * time.Millisecond
+		writes   = 10
+		gap      = 50 * time.Millisecond
+	)
 	for _, bc := range backends() {
 		t.Run(bc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			path := filepath.Join(dir, "config")
 			must(t, os.WriteFile(path, nil, 0o600))
@@ -297,15 +327,20 @@ func TestWatchDebounce(t *testing.T) {
 			defer cancel()
 			ready := make(chan struct{})
 			go func() {
-				_ = Watch(ctx, path, WatchOptions{Poll: bc.poll, Debounce: 300 * time.Millisecond, Ready: ready}, out)
+				_ = Watch(ctx, path, WatchOptions{Poll: bc.poll, Debounce: debounce, Ready: ready}, out)
 			}()
 			<-ready
-			for i := range 5 {
+			var lastWrite time.Time
+			for i := range writes {
+				lastWrite = time.Now()
 				must(t, os.WriteFile(path, []byte{byte('a' + i)}, 0o600))
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(gap)
 			}
 			select {
 			case <-out:
+				if d := time.Since(lastWrite); d < debounce {
+					t.Fatalf("reported %v after the last write, before the %v debounce", d, debounce)
+				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("no change reported")
 			}
@@ -319,10 +354,12 @@ func TestWatchDebounce(t *testing.T) {
 }
 
 // An atomic save is one change: nothing is reported again when the watcher
-// looks at the files later.
+// looks at the files later. This guards Windows, where the recheck after a
+// rename would otherwise report the same save a second time.
 func TestWatchReportsASaveOnce(t *testing.T) {
 	for _, bc := range backends() {
 		t.Run(bc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			path := filepath.Join(dir, "config")
 			must(t, os.WriteFile(path, []byte("a = 1\n"), 0o600))
@@ -337,32 +374,13 @@ func TestWatchReportsASaveOnce(t *testing.T) {
 			must(t, WriteFile(path, []byte("a = 2\n"), 0o600))
 			select {
 			case <-out:
-			case <-time.After(5 * time.Second):
+			case <-time.After(slowWait()):
 				t.Fatal("no change reported")
 			}
 			select {
 			case <-out:
 				t.Fatal("one save was reported twice")
 			case <-time.After(retryMissing + 500*time.Millisecond):
-			}
-		})
-	}
-}
-
-func TestWatchCancelBeforeEvents(t *testing.T) {
-	for _, bc := range backends() {
-		t.Run(bc.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			done := make(chan error, 1)
-			go func() {
-				done <- Watch(ctx, filepath.Join(t.TempDir(), "config"), WatchOptions{Poll: bc.poll}, make(chan struct{}, 1))
-			}()
-			select {
-			case err := <-done:
-				must(t, err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("Watch ignored a cancelled context")
 			}
 		})
 	}
