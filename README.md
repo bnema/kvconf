@@ -25,7 +25,7 @@ output.DP-1.scale = 1.5
   (see [Performance](#performance)).
 
 ```sh
-go get github.com/bnema/kvconf
+go get bnema.dev/kvconf
 ```
 
 ## Quick start

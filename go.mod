@@ -1,3 +1,3 @@
-module github.com/bnema/kvconf
+module bnema.dev/kvconf
 
 go 1.27
